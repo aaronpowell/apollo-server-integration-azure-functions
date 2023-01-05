@@ -1,48 +1,38 @@
-import type {
-  AzureFunction,
-  Context,
-  HttpRequest,
-  HttpRequestHeaders,
-} from '@azure/functions';
 import {
   ApolloServer,
+  ApolloServerOptions,
   BaseContext,
   ContextFunction,
-  HeaderMap,
-  HTTPGraphQLRequest,
 } from '@apollo/server';
-import type { WithRequired } from '@apollo/utils.withrequired';
+import type { HttpHandler, InvocationContext } from '@azure/functions';
+import type { app } from '@azure/functions';
+import { normalizeRequest } from './normalizeRequest';
 
 export interface AzureFunctionsContextFunctionArgument {
-  context: Context;
+  context: InvocationContext;
 }
 
-export interface AzureFunctionsMiddlewareOptions<TContext extends BaseContext> {
+export type AzureFunctionsMiddlewareOptions<TContext extends BaseContext> = {
   context?: ContextFunction<[AzureFunctionsContextFunctionArgument], TContext>;
-}
+  endpoint?: string;
+} & ApolloServerOptions<BaseContext>;
 
 const defaultContext: ContextFunction<
   [AzureFunctionsContextFunctionArgument],
   any
 > = async () => ({});
 
-export function startServerAndCreateHandler(
-  server: ApolloServer<BaseContext>,
-  options?: AzureFunctionsMiddlewareOptions<BaseContext>,
-): AzureFunction;
-export function startServerAndCreateHandler<TContext extends BaseContext>(
-  server: ApolloServer<TContext>,
-  options: WithRequired<AzureFunctionsMiddlewareOptions<TContext>, 'context'>,
-): AzureFunction;
-export function startServerAndCreateHandler<TContext extends BaseContext>(
-  server: ApolloServer<TContext>,
-  options?: AzureFunctionsMiddlewareOptions<TContext>,
-): AzureFunction {
-  server.startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests();
-  return async (context: Context, req: HttpRequest) => {
+export const azureFunctionsApollo = <TContext extends BaseContext>(
+  functionsApp: typeof app,
+  options: AzureFunctionsMiddlewareOptions<TContext>,
+) => {
+  const { context, ...serverOptions } = options;
+  const server = new ApolloServer(serverOptions);
+
+  const handler: HttpHandler = async (req, context) => {
     const contextFunction = options?.context ?? defaultContext;
     try {
-      const normalizedRequest = normalizeRequest(req);
+      const normalizedRequest = await normalizeRequest(req);
 
       const { body, headers, status } = await server.executeHTTPGraphQLRequest({
         httpGraphQLRequest: normalizedRequest,
@@ -62,47 +52,19 @@ export function startServerAndCreateHandler<TContext extends BaseContext>(
         body: body.string,
       };
     } catch (e) {
-      context.log.error('Failure processing GraphQL request', e);
+      context.error('Failure processing GraphQL request', e);
       return {
         status: 400,
         body: (e as Error).message,
       };
     }
   };
-}
 
-function normalizeRequest(req: HttpRequest): HTTPGraphQLRequest {
-  if (!req.method) {
-    throw new Error('No method');
-  }
+  functionsApp.http(options.endpoint || 'graphql', {
+    handler,
+    methods: ['GET', 'POST'],
+    authLevel: 'anonymous',
+  });
 
-  return {
-    method: req.method,
-    headers: normalizeHeaders(req.headers),
-    search: new URL(req.url).search,
-    body: parseBody(req.body, req.headers['content-type']),
-  };
-}
-
-function parseBody(
-  body: string | null | undefined,
-  contentType: string | undefined,
-): object | string {
-  if (body) {
-    if (contentType === 'application/json' && typeof body === 'string') {
-      return JSON.parse(body);
-    }
-    if (contentType === 'text/plain') {
-      return body;
-    }
-  }
-  return '';
-}
-
-function normalizeHeaders(headers: HttpRequestHeaders): HeaderMap {
-  const headerMap = new HeaderMap();
-  for (const [key, value] of Object.entries(headers)) {
-    headerMap.set(key, value ?? '');
-  }
-  return headerMap;
-}
+  server.startInBackgroundHandlingStartupErrorsByLoggingAndFailingAllRequests();
+};
